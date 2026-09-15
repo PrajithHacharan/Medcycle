@@ -1,0 +1,304 @@
+-- ============================================================
+-- MedCycle Database Schema
+-- Digital Platform for Redistribution of Surplus Unexpired Medicines
+-- Engine: MySQL 8.x (InnoDB, utf8mb4)
+-- ============================================================
+
+CREATE DATABASE IF NOT EXISTS medcycle_db
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE medcycle_db;
+
+SET FOREIGN_KEY_CHECKS = 0;
+
+-- ============================================================
+-- 1. CORE USER / AUTH TABLES
+-- ============================================================
+
+CREATE TABLE users (
+    user_id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    email             VARCHAR(255) NOT NULL UNIQUE,
+    password_hash     VARCHAR(255) NOT NULL,
+    role              ENUM('donor', 'pharmacist', 'ngo', 'admin', 'logistics') NOT NULL,
+    phone             VARCHAR(20),
+    is_active         BOOLEAN DEFAULT TRUE,
+    email_verified    BOOLEAN DEFAULT FALSE,
+    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+-- ============================================================
+-- 2. STAKEHOLDER PROFILE TABLES (Donors, NGOs, Pharmacists, Admins)
+-- ============================================================
+
+CREATE TABLE donors (
+    donor_id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id             BIGINT UNSIGNED NOT NULL UNIQUE,
+    institution_name    VARCHAR(255) NOT NULL,
+    institution_type    ENUM('hospital', 'clinic', 'nursing_home', 'pharmacy') NOT NULL,
+    license_number      VARCHAR(100) NOT NULL,
+    registration_proof_url VARCHAR(500),
+    contact_person      VARCHAR(150),
+    address_line        VARCHAR(255),
+    city                VARCHAR(100),
+    state               VARCHAR(100),
+    pincode             VARCHAR(10),
+    verification_status ENUM('pending', 'verified', 'rejected') DEFAULT 'pending',
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE ngos (
+    ngo_id               BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id              BIGINT UNSIGNED NOT NULL UNIQUE,
+    ngo_name             VARCHAR(255) NOT NULL,
+    registration_number  VARCHAR(100) NOT NULL,
+    registration_proof_url VARCHAR(500),
+    contact_person       VARCHAR(150),
+    address_line         VARCHAR(255),
+    city                 VARCHAR(100),
+    state                VARCHAR(100),
+    pincode              VARCHAR(10),
+    beneficiary_scope    TEXT,                 -- description of communities served
+    verification_status  ENUM('pending', 'verified', 'rejected') DEFAULT 'pending',
+    membership_tier      ENUM('standard', 'priority') DEFAULT 'standard',
+    created_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE pharmacists (
+    pharmacist_id       BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id             BIGINT UNSIGNED NOT NULL UNIQUE,
+    full_name           VARCHAR(150) NOT NULL,
+    license_number      VARCHAR(100) NOT NULL UNIQUE,
+    qualification        VARCHAR(150),
+    empanelment_date    DATE,
+    status              ENUM('active', 'suspended', 'inactive') DEFAULT 'active',
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- ============================================================
+-- 3. MEDICINE LISTING (Workflow Step 1)
+-- ============================================================
+
+CREATE TABLE medicines (
+    medicine_id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    donor_id            BIGINT UNSIGNED NOT NULL,
+    medicine_name        VARCHAR(255) NOT NULL,
+    generic_name         VARCHAR(255),
+    category             VARCHAR(100),          -- e.g. antibiotic, analgesic
+    batch_number          VARCHAR(100) NOT NULL,
+    manufacturing_date    DATE NOT NULL,
+    expiry_date            DATE NOT NULL,
+    quantity_available     INT UNSIGNED NOT NULL,
+    unit                   ENUM('tablets', 'strips', 'bottles', 'vials', 'boxes', 'ml', 'units') NOT NULL,
+    storage_condition       VARCHAR(150),        -- e.g. "Store below 25°C"
+    requires_cold_chain      BOOLEAN DEFAULT FALSE,
+    description              TEXT,
+    image_url                 VARCHAR(500),
+    status  ENUM(
+        'submitted',              -- step 1 complete
+        'auto_check_passed',
+        'auto_check_failed',
+        'pending_pharmacist_review', -- step 3
+        'pharmacist_approved',
+        'pharmacist_rejected',
+        'listed',                 -- visible to NGOs (step 3 complete)
+        'requested',               -- an NGO has an active request
+        'allocated',               -- step 4 complete
+        'in_delivery',             -- step 5
+        'delivered',                -- step 5 complete
+        'expired',
+        'withdrawn'
+    ) DEFAULT 'submitted',
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at    DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (donor_id) REFERENCES donors(donor_id) ON DELETE CASCADE,
+    INDEX idx_medicine_status (status),
+    INDEX idx_medicine_expiry (expiry_date)
+) ENGINE=InnoDB;
+
+-- ============================================================
+-- 4. AUTOMATED COMPLIANCE VERIFICATION (Workflow Step 2)
+-- ============================================================
+
+CREATE TABLE compliance_checks (
+    check_id                 BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    medicine_id               BIGINT UNSIGNED NOT NULL,
+    shelf_life_remaining_days  INT,
+    min_threshold_days          INT DEFAULT 90,   -- configurable regulatory minimum
+    batch_number_valid           BOOLEAN,
+    quantity_consistent           BOOLEAN,
+    storage_info_consistent        BOOLEAN,
+    overall_result                  ENUM('passed', 'failed') NOT NULL,
+    failure_reason                   VARCHAR(255),
+    checked_at                        DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (medicine_id) REFERENCES medicines(medicine_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- ============================================================
+-- 5. LICENSED PHARMACIST APPROVAL (Workflow Step 3)
+-- ============================================================
+
+CREATE TABLE pharmacist_approvals (
+    approval_id     BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    medicine_id      BIGINT UNSIGNED NOT NULL,
+    pharmacist_id     BIGINT UNSIGNED NOT NULL,
+    decision           ENUM('approved', 'rejected', 'needs_more_info') NOT NULL,
+    remarks              TEXT,
+    reviewed_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (medicine_id) REFERENCES medicines(medicine_id) ON DELETE CASCADE,
+    FOREIGN KEY (pharmacist_id) REFERENCES pharmacists(pharmacist_id) ON DELETE RESTRICT
+) ENGINE=InnoDB;
+
+-- ============================================================
+-- 6. NGO REQUEST & ALLOCATION (Workflow Step 4)
+-- ============================================================
+
+CREATE TABLE ngo_requests (
+    request_id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    ngo_id                  BIGINT UNSIGNED NOT NULL,
+    medicine_id              BIGINT UNSIGNED NOT NULL,
+    quantity_requested         INT UNSIGNED NOT NULL,
+    beneficiary_profile          TEXT,           -- who the medicine is for
+    priority_level                 ENUM('normal', 'urgent') DEFAULT 'normal',
+    status                          ENUM('pending', 'approved', 'rejected', 'fulfilled', 'cancelled') DEFAULT 'pending',
+    requested_at                     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (ngo_id) REFERENCES ngos(ngo_id) ON DELETE CASCADE,
+    FOREIGN KEY (medicine_id) REFERENCES medicines(medicine_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE allocations (
+    allocation_id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    request_id               BIGINT UNSIGNED NOT NULL,
+    medicine_id                BIGINT UNSIGNED NOT NULL,
+    quantity_allocated            INT UNSIGNED NOT NULL,
+    allocation_basis                ENUM('first_come_first_served', 'needs_priority') DEFAULT 'first_come_first_served',
+    allocated_at                      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (request_id) REFERENCES ngo_requests(request_id) ON DELETE CASCADE,
+    FOREIGN KEY (medicine_id) REFERENCES medicines(medicine_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- ============================================================
+-- 7. SECURE LOGISTICS & DELIVERY (Workflow Step 5)
+-- ============================================================
+
+CREATE TABLE logistics_partners (
+    logistics_partner_id   BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    partner_name              VARCHAR(255) NOT NULL,
+    contact_person              VARCHAR(150),
+    phone                         VARCHAR(20),
+    service_area                   VARCHAR(255),
+    supports_cold_chain              BOOLEAN DEFAULT FALSE,
+    created_at                        DATETIME DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+CREATE TABLE deliveries (
+    delivery_id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    allocation_id              BIGINT UNSIGNED NOT NULL,
+    logistics_partner_id         BIGINT UNSIGNED,
+    pickup_address                 VARCHAR(255),
+    delivery_address                 VARCHAR(255),
+    temperature_requirement            VARCHAR(100),
+    tracking_number                     VARCHAR(100),
+    status                                ENUM('scheduled', 'picked_up', 'in_transit', 'delivered', 'failed') DEFAULT 'scheduled',
+    scheduled_date                         DATE,
+    delivered_at                             DATETIME,
+    created_at                                DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (allocation_id) REFERENCES allocations(allocation_id) ON DELETE CASCADE,
+    FOREIGN KEY (logistics_partner_id) REFERENCES logistics_partners(logistics_partner_id) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+-- ============================================================
+-- 8. TRANSACTION RECORDING & AUDIT TRAIL (Workflow Step 6)
+-- ============================================================
+
+CREATE TABLE audit_logs (
+    audit_id        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    entity_type       VARCHAR(50) NOT NULL,   -- e.g. 'medicine', 'allocation', 'delivery'
+    entity_id           BIGINT UNSIGNED NOT NULL,
+    action                VARCHAR(100) NOT NULL, -- e.g. 'listed', 'approved', 'delivered'
+    performed_by_user_id    BIGINT UNSIGNED,
+    details                    JSON,
+    created_at                  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (performed_by_user_id) REFERENCES users(user_id) ON DELETE SET NULL,
+    INDEX idx_audit_entity (entity_type, entity_id)
+) ENGINE=InnoDB;
+
+-- ============================================================
+-- 9. BUSINESS MODEL / REVENUE TABLES
+-- ============================================================
+
+CREATE TABLE subscriptions (
+    subscription_id       BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    donor_id                BIGINT UNSIGNED NOT NULL,
+    plan_type                  ENUM('basic', 'standard', 'premium') NOT NULL,
+    amount                        DECIMAL(10,2) NOT NULL,
+    start_date                     DATE NOT NULL,
+    end_date                         DATE NOT NULL,
+    status                             ENUM('active', 'expired', 'cancelled') DEFAULT 'active',
+    created_at                          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (donor_id) REFERENCES donors(donor_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE csr_reports (
+    report_id                 BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    donor_id                     BIGINT UNSIGNED NOT NULL,
+    period_start                    DATE NOT NULL,
+    period_end                        DATE NOT NULL,
+    medicines_donated_count             INT UNSIGNED DEFAULT 0,
+    total_quantity_donated                 INT UNSIGNED DEFAULT 0,
+    report_file_url                          VARCHAR(500),
+    generated_at                               DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (donor_id) REFERENCES donors(donor_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE ngo_membership_fees (
+    fee_id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    ngo_id              BIGINT UNSIGNED NOT NULL,
+    amount                 DECIMAL(10,2) NOT NULL,
+    payment_date              DATE NOT NULL,
+    valid_until                 DATE NOT NULL,
+    created_at                    DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (ngo_id) REFERENCES ngos(ngo_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE payments (
+    payment_id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    payer_user_id            BIGINT UNSIGNED NOT NULL,
+    payment_type                ENUM('subscription', 'ngo_membership', 'logistics_fee', 'grant', 'other') NOT NULL,
+    reference_id                   BIGINT UNSIGNED,   -- points to subscriptions.id / ngo_membership_fees.id etc.
+    amount                            DECIMAL(10,2) NOT NULL,
+    payment_gateway_ref                  VARCHAR(150),
+    status                                  ENUM('pending', 'successful', 'failed', 'refunded') DEFAULT 'pending',
+    paid_at                                    DATETIME,
+    created_at                                    DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (payer_user_id) REFERENCES users(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- ============================================================
+-- 10. NOTIFICATIONS (supporting table for platform UX)
+-- ============================================================
+
+CREATE TABLE notifications (
+    notification_id      BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id                 BIGINT UNSIGNED NOT NULL,
+    title                      VARCHAR(150),
+    message                       TEXT NOT NULL,
+    type                            VARCHAR(50),   -- e.g. 'medicine_approved', 'request_fulfilled'
+    is_read                            BOOLEAN DEFAULT FALSE,
+    created_at                            DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+SET FOREIGN_KEY_CHECKS = 1;
+
+-- ============================================================
+-- USEFUL INDEXES FOR COMMON QUERIES
+-- ============================================================
+
+CREATE INDEX idx_medicines_donor ON medicines(donor_id);
+CREATE INDEX idx_requests_ngo ON ngo_requests(ngo_id);
+CREATE INDEX idx_requests_status ON ngo_requests(status);
+CREATE INDEX idx_deliveries_status ON deliveries(status);
+CREATE INDEX idx_payments_status ON payments(status);
